@@ -17,6 +17,7 @@ CONF_BAUDRATE = "baudrate"
 
 DEFAULT_NAME = "Serial Sensor"
 DEFAULT_BAUDRATE = 9600
+RETRY_TIME_SECONDS = 10
 
 PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
     {
@@ -65,26 +66,45 @@ class SerialSensor(Entity):
 
     async def serial_read(self, device, rate, **kwargs):
         """Read the data from the port."""
-        reader, _ = await serial_asyncio.open_serial_connection(
-            url=device, baudrate=rate, **kwargs
-        )
         while True:
-            line = await reader.readline()
-            line = line.decode("utf-8").strip()
-
             try:
-                data = json.loads(line)
-                if isinstance(data, dict):
-                    self._attributes = data
-            except ValueError:
-                pass
+                reader, _ = await serial_asyncio.open_serial_connection(
+                    url=device, baudrate=rate, **kwargs
+                )
+            except Exception as e:
+                _LOGGER.error("Unable to connect to serial device %s: %s", device, str(e))
+                # Sleep for a bit then try again. Handles the case where the serial device
+                # is disconnected (or disconnects itself in some cases), then reconnected later.
+                await asyncio.sleep(RETRY_TIME_SECONDS)
+                continue
 
-            if self._template is not None:
-                line = self._template.async_render_with_possible_json_value(line)
+            _LOGGER.debug("Serial device %s connected.", device)
+            while True:
+                try:
+                    line = await reader.readline()
+                    line = line.decode("utf-8").strip()
 
-            _LOGGER.debug("Received: %s", line)
-            self._state = line
-            self.async_write_ha_state()
+                    try:
+                        data = json.loads(line)
+                        if isinstance(data, dict):
+                            self._attributes = data
+                    except ValueError:
+                        pass
+
+                    if self._template is not None:
+                        line = self._template.async_render_with_possible_json_value(line)
+
+                    _LOGGER.debug("Received: %s", line)
+                    self._state = line
+                    self.async_write_ha_state()
+                except Exception as e:
+                    # Serial device has probably been disconnected. 
+                    # Exit the read loop and attempt to reconnect.
+                    self._state = None
+                    self._attributes = None
+                    self.async_write_ha_state()
+                    _LOGGER.error("Error while reading from device %s: %s", device, str(e))
+                    break
 
     async def stop_serial_read(self):
         """Close resources."""
